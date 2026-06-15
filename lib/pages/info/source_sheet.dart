@@ -13,9 +13,69 @@ import 'package:kazumi/pages/collect/collect_controller.dart';
 import 'package:kazumi/bean/widget/error_widget.dart';
 import 'dart:async';
 import 'dart:convert';
+import 'package:kazumi/services/plugin/captcha_ocr_service.dart';
 import 'package:kazumi/services/plugin/captcha_verification_service.dart';
 import 'package:kazumi/plugins/anti_crawler_config.dart';
 import 'package:kazumi/utils/device.dart';
+
+enum _CaptchaVerificationPhase {
+  idle,
+  silentRunning,
+  silentFailed,
+  manualRunning,
+}
+
+class _CaptchaVerificationKey {
+  const _CaptchaVerificationKey({
+    required this.pluginName,
+    required this.keyword,
+    required this.searchUrl,
+    required this.captchaType,
+  });
+
+  final String pluginName;
+  final String keyword;
+  final String searchUrl;
+  final int captchaType;
+
+  @override
+  bool operator ==(Object other) {
+    return other is _CaptchaVerificationKey &&
+        other.pluginName == pluginName &&
+        other.keyword == keyword &&
+        other.searchUrl == searchUrl &&
+        other.captchaType == captchaType;
+  }
+
+  @override
+  int get hashCode => Object.hash(pluginName, keyword, searchUrl, captchaType);
+}
+
+class _CaptchaVerificationRun {
+  final ValueNotifier<_CaptchaVerificationPhase> phase =
+      ValueNotifier<_CaptchaVerificationPhase>(_CaptchaVerificationPhase.idle);
+  CaptchaVerificationService? service;
+  StreamSubscription<String?>? imageSub;
+  Timer? timeout;
+  bool silentAttempted = false;
+  bool imageHandled = false;
+  bool disposed = false;
+
+  bool get isRunning =>
+      phase.value == _CaptchaVerificationPhase.silentRunning ||
+      phase.value == _CaptchaVerificationPhase.manualRunning;
+
+  Future<void> dispose() async {
+    disposed = true;
+    timeout?.cancel();
+    timeout = null;
+    await imageSub?.cancel();
+    imageSub = null;
+    service?.dispose();
+    service = null;
+    phase.dispose();
+  }
+}
 
 class SourceSheet extends StatefulWidget {
   const SourceSheet({
@@ -47,6 +107,10 @@ class _SourceSheetState extends State<SourceSheet>
 
   /// Timeout timer waiting for captcha verification result
   Timer? _captchaVerifyTimer;
+  final CaptchaOcrService _captchaOcrService = createCaptchaOcrService();
+  final Map<_CaptchaVerificationKey, _CaptchaVerificationRun>
+      _captchaVerificationRuns =
+      <_CaptchaVerificationKey, _CaptchaVerificationRun>{};
 
   @override
   void initState() {
@@ -67,6 +131,13 @@ class _SourceSheetState extends State<SourceSheet>
     _captchaVerificationService = null;
     _captchaVerifyTimer?.cancel();
     _captchaVerifyTimer = null;
+    final runs = List<_CaptchaVerificationRun>.from(
+      _captchaVerificationRuns.values,
+    );
+    _captchaVerificationRuns.clear();
+    for (final run in runs) {
+      unawaited(run.dispose());
+    }
     super.dispose();
   }
 
@@ -80,28 +151,191 @@ class _SourceSheetState extends State<SourceSheet>
         showButtonClickDialog(plugin);
         break;
       default:
-        showCaptchaDialog(plugin);
+        _startManualCaptchaVerification(plugin);
     }
   }
 
-  void showCaptchaDialog(Plugin plugin) {
+  String _searchUrlFor(Plugin plugin) {
+    return plugin.searchURL.replaceAll(
+      '@keyword',
+      Uri.encodeQueryComponent(keyword),
+    );
+  }
+
+  _CaptchaVerificationKey _captchaVerificationKeyFor(Plugin plugin) {
+    return _CaptchaVerificationKey(
+      pluginName: plugin.name,
+      keyword: keyword,
+      searchUrl: _searchUrlFor(plugin),
+      captchaType: plugin.antiCrawlerConfig.captchaType,
+    );
+  }
+
+  _CaptchaVerificationRun _runFor(_CaptchaVerificationKey key) {
+    return _captchaVerificationRuns.putIfAbsent(
+      key,
+      () => _CaptchaVerificationRun(),
+    );
+  }
+
+  bool _shouldAttemptSilentCaptcha(Plugin plugin) {
+    return plugin.antiCrawlerConfig.captchaType == CaptchaType.imageCaptcha &&
+        _captchaOcrService.isEnabled &&
+        _captchaOcrService.shouldAutoSubmit;
+  }
+
+  void _scheduleSilentCaptchaVerification(Plugin plugin) {
+    final key = _captchaVerificationKeyFor(plugin);
+    final run = _runFor(key);
+    if (run.disposed || run.silentAttempted || run.isRunning) return;
+    run.silentAttempted = true;
+    KazumiLogger().i(
+      '[CaptchaOcrService] captcha challenge route: plugin=${plugin.name}, enabled=${_captchaOcrService.isEnabled}, autosubmit=${_captchaOcrService.shouldAutoSubmit}',
+      forceLog: true,
+    );
+    unawaited(
+      _trySilentCaptchaVerification(
+        plugin,
+        _captchaOcrService,
+        key: key,
+        run: run,
+      ),
+    );
+  }
+
+  void _startManualCaptchaVerification(Plugin plugin) {
+    final key = _captchaVerificationKeyFor(plugin);
+    final run = _runFor(key);
+    if (run.disposed || run.isRunning) return;
+    showCaptchaDialog(plugin, key: key, run: run);
+  }
+
+  Future<void> _trySilentCaptchaVerification(
+    Plugin plugin,
+    CaptchaOcrService ocrService, {
+    required _CaptchaVerificationKey key,
+    required _CaptchaVerificationRun run,
+  }) async {
+    if (run.disposed || run.isRunning) return;
+    run.phase.value = _CaptchaVerificationPhase.silentRunning;
+    run.imageHandled = false;
+    await run.imageSub?.cancel();
+    run.imageSub = null;
+    run.timeout?.cancel();
+    run.timeout = null;
+    run.service?.dispose();
+    run.service = CaptchaVerificationService();
+    final captchaService = run.service!;
+    final searchUrl = key.searchUrl;
+    var finished = false;
+
+    Future<void> finish({required bool verified}) async {
+      if (finished) return;
+      finished = true;
+      run.timeout?.cancel();
+      run.timeout = null;
+      await run.imageSub?.cancel();
+      run.imageSub = null;
+      if (run.disposed) {
+        if (run.service == captchaService) {
+          run.service = null;
+        }
+        captchaService.dispose();
+        return;
+      }
+      if (verified) {
+        run.phase.value = _CaptchaVerificationPhase.idle;
+        run.service = null;
+        captchaService.dispose();
+        pluginSearchService?.querySource(keyword, plugin.name);
+      } else {
+        KazumiLogger().i(
+          '[CaptchaOcrService] silent captcha verification failed for ${plugin.name}; manual verification remains available',
+          forceLog: true,
+        );
+        await captchaService.saveAndUnload(plugin.name);
+        run.phase.value = _CaptchaVerificationPhase.silentFailed;
+        run.service = null;
+        captchaService.dispose();
+      }
+    }
+
+    run.timeout = Timer(const Duration(seconds: 60), () {
+      unawaited(finish(verified: false));
+    });
+
+    run.imageSub = captchaService.onCaptchaImageUrl.listen((imageUrl) async {
+      if (finished || imageUrl == null) return;
+      if (run.imageHandled) return;
+      run.imageHandled = true;
+      KazumiLogger().i(
+        '[CaptchaOcrService] silent captcha image received for ${plugin.name}: ${imageUrl.length} chars',
+        forceLog: true,
+      );
+      final result = await ocrService.recognizeDataUrl(imageUrl);
+      if (finished) return;
+      if (result == null) {
+        await finish(verified: false);
+        return;
+      }
+
+      run.timeout?.cancel();
+      run.timeout = Timer(const Duration(seconds: 10), () {
+        unawaited(finish(verified: false));
+      });
+
+      try {
+        await captchaService.submitCaptcha(
+          captchaCode: result.code,
+          inputXpath: plugin.antiCrawlerConfig.captchaInput,
+          buttonXpath: plugin.antiCrawlerConfig.captchaButton,
+          pluginName: plugin.name,
+          onVerified: () => unawaited(finish(verified: true)),
+        );
+      } catch (error) {
+        KazumiLogger().w(
+          '[CaptchaOcrService] silent captcha submit failed for ${plugin.name}: $error',
+          forceLog: true,
+        );
+        await finish(verified: false);
+      }
+    });
+
+    try {
+      await captchaService.loadForCaptcha(
+        searchUrl,
+        plugin.antiCrawlerConfig.captchaImage,
+        inputXpath: plugin.antiCrawlerConfig.captchaInput,
+      );
+    } catch (error) {
+      KazumiLogger().w(
+        '[CaptchaOcrService] silent captcha load failed for ${plugin.name}: $error',
+        forceLog: true,
+      );
+      await finish(verified: false);
+    }
+  }
+
+  void showCaptchaDialog(
+    Plugin plugin, {
+    _CaptchaVerificationKey? key,
+    _CaptchaVerificationRun? run,
+  }) {
+    key ??= _captchaVerificationKeyFor(plugin);
+    final activeRun = run ?? _runFor(key);
+    if (activeRun.disposed || activeRun.isRunning) return;
+    activeRun.phase.value = _CaptchaVerificationPhase.manualRunning;
+
     /// flag whether verification has passed, used to distinguish normal dismissal from cancellation in onDismiss
     bool verified = false;
 
-    _captchaVerificationService?.dispose();
-    _captchaVerificationService = CaptchaVerificationService();
-
-    final searchUrl = plugin.searchURL
-        .replaceAll('@keyword', Uri.encodeQueryComponent(keyword));
-
-    _captchaVerificationService!.loadForCaptcha(
-      searchUrl,
-      plugin.antiCrawlerConfig.captchaImage,
-      inputXpath: plugin.antiCrawlerConfig.captchaInput,
-    );
+    activeRun.service?.dispose();
+    activeRun.service = CaptchaVerificationService();
+    final searchUrl = key.searchUrl;
+    final captchaService = activeRun.service!;
 
     Future<void> submitCaptcha(String captchaCode) async {
-      await _captchaVerificationService?.submitCaptcha(
+      await captchaService.submitCaptcha(
         captchaCode: captchaCode.trim(),
         inputXpath: plugin.antiCrawlerConfig.captchaInput,
         buttonXpath: plugin.antiCrawlerConfig.captchaButton,
@@ -110,6 +344,7 @@ class _SourceSheetState extends State<SourceSheet>
           _captchaVerifyTimer?.cancel();
           _captchaVerifyTimer = null;
           verified = true;
+          activeRun.phase.value = _CaptchaVerificationPhase.idle;
           KazumiDialog.dismiss();
           // show a 3s countdown progress dialog before re-querying,
           // to avoid triggering rate limits immediately after verification.
@@ -138,13 +373,10 @@ class _SourceSheetState extends State<SourceSheet>
       onDismiss: () async {
         _captchaVerifyTimer?.cancel();
         _captchaVerifyTimer = null;
-        // Capture the current service instance locally before any await.
-        // Without this, an async gap could allow _captchaVerificationService to be
-        // replaced (or nulled by _SourceSheetState.dispose()), causing the
-        // closure to dispose the wrong/already-disposed instance.
-        final captchaService = _captchaVerificationService;
-        _captchaVerificationService = null;
+        final captchaService = activeRun.service;
+        activeRun.service = null;
         if (!verified) {
+          activeRun.phase.value = _CaptchaVerificationPhase.idle;
           await captchaService?.saveAndUnload(plugin.name);
           captchaService?.dispose();
           pluginSearchService?.querySource(keyword, plugin.name);
@@ -154,7 +386,12 @@ class _SourceSheetState extends State<SourceSheet>
       },
       builder: (context) => _CaptchaDialog(
         pluginName: plugin.name,
-        captchaImageStream: _captchaVerificationService!.onCaptchaImageUrl,
+        captchaImageStream: captchaService.onCaptchaImageUrl,
+        onReady: () => unawaited(captchaService.loadForCaptcha(
+          searchUrl,
+          plugin.antiCrawlerConfig.captchaImage,
+          inputXpath: plugin.antiCrawlerConfig.captchaInput,
+        )),
         onSubmit: submitCaptcha,
       ),
     );
@@ -290,19 +527,16 @@ class _SourceSheetState extends State<SourceSheet>
       return const Center(child: CircularProgressIndicator());
     }
     if (status == 'captcha') {
-      return GeneralErrorWidget(
-        errMsg: '${plugin.name} 需要验证码验证',
-        actions: [
-          GeneralErrorButton(
-            onPressed: () => showAntiCrawlerDialog(plugin),
-            text: '进行验证',
-          ),
-          GeneralErrorButton(
-            onPressed: () =>
-                pluginSearchService?.querySource(keyword, plugin.name),
-            text: '重试',
-          ),
-        ],
+      final key = _captchaVerificationKeyFor(plugin);
+      final run = _runFor(key);
+      return _CaptchaChallengeView(
+        pluginName: plugin.name,
+        run: run,
+        shouldAttemptSilent: _shouldAttemptSilentCaptcha(plugin),
+        onSilentAttempt: () => _scheduleSilentCaptchaVerification(plugin),
+        onManualPressed: () => showAntiCrawlerDialog(plugin),
+        onRetryPressed: () =>
+            pluginSearchService?.querySource(keyword, plugin.name),
       );
     }
     if (status == 'noResult') {
@@ -373,8 +607,8 @@ class _SourceSheetState extends State<SourceSheet>
                   TextButton(
                     style: TextButton.styleFrom(
                       minimumSize: Size.zero,
-                      padding:
-                          const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 8, vertical: 10),
                       tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                       visualDensity: VisualDensity.compact,
                       textStyle: Theme.of(context).textTheme.bodySmall,
@@ -385,8 +619,8 @@ class _SourceSheetState extends State<SourceSheet>
                   TextButton(
                     style: TextButton.styleFrom(
                       minimumSize: Size.zero,
-                      padding:
-                          const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 8, vertical: 10),
                       tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                       visualDensity: VisualDensity.compact,
                       textStyle: Theme.of(context).textTheme.bodySmall,
@@ -614,15 +848,107 @@ class _SourceSheetState extends State<SourceSheet>
   }
 }
 
+class _CaptchaChallengeView extends StatefulWidget {
+  const _CaptchaChallengeView({
+    required this.pluginName,
+    required this.run,
+    required this.shouldAttemptSilent,
+    required this.onSilentAttempt,
+    required this.onManualPressed,
+    required this.onRetryPressed,
+  });
+
+  final String pluginName;
+  final _CaptchaVerificationRun run;
+  final bool shouldAttemptSilent;
+  final VoidCallback onSilentAttempt;
+  final VoidCallback onManualPressed;
+  final VoidCallback onRetryPressed;
+
+  @override
+  State<_CaptchaChallengeView> createState() => _CaptchaChallengeViewState();
+}
+
+class _CaptchaChallengeViewState extends State<_CaptchaChallengeView> {
+  @override
+  void initState() {
+    super.initState();
+    _scheduleSilentAttemptIfNeeded();
+  }
+
+  @override
+  void didUpdateWidget(covariant _CaptchaChallengeView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.run != widget.run ||
+        oldWidget.shouldAttemptSilent != widget.shouldAttemptSilent) {
+      _scheduleSilentAttemptIfNeeded();
+    }
+  }
+
+  void _scheduleSilentAttemptIfNeeded() {
+    if (!widget.shouldAttemptSilent ||
+        widget.run.silentAttempted ||
+        widget.run.isRunning) {
+      return;
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted ||
+          !widget.shouldAttemptSilent ||
+          widget.run.silentAttempted ||
+          widget.run.isRunning) {
+        return;
+      }
+      widget.onSilentAttempt();
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ValueListenableBuilder<_CaptchaVerificationPhase>(
+      valueListenable: widget.run.phase,
+      builder: (context, phase, _) {
+        final isRunning = phase == _CaptchaVerificationPhase.silentRunning ||
+            phase == _CaptchaVerificationPhase.manualRunning;
+        final message = switch (phase) {
+          _CaptchaVerificationPhase.silentRunning =>
+            '${widget.pluginName} 正在自动验证，请稍候',
+          _CaptchaVerificationPhase.silentFailed =>
+            '${widget.pluginName} 自动验证失败，可手动验证',
+          _CaptchaVerificationPhase.manualRunning =>
+            '${widget.pluginName} 正在手动验证，请稍候',
+          _ => '${widget.pluginName} 需要验证码验证',
+        };
+        final manualText =
+            phase == _CaptchaVerificationPhase.silentFailed ? '手动验证' : '进行验证';
+        return GeneralErrorWidget(
+          errMsg: message,
+          actions: [
+            FilledButton.tonal(
+              onPressed: isRunning ? null : widget.onManualPressed,
+              child: Text(manualText),
+            ),
+            FilledButton.tonal(
+              onPressed: isRunning ? null : widget.onRetryPressed,
+              child: const Text('重试'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
+
 class _CaptchaDialog extends StatefulWidget {
   const _CaptchaDialog({
     required this.pluginName,
     required this.captchaImageStream,
+    required this.onReady,
     required this.onSubmit,
   });
 
   final String pluginName;
   final Stream<String?> captchaImageStream;
+  final VoidCallback onReady;
   final Future<void> Function(String captchaCode) onSubmit;
 
   @override
@@ -633,6 +959,7 @@ class _CaptchaDialogState extends State<_CaptchaDialog> {
   final ValueNotifier<String?> _captchaImageNotifier =
       ValueNotifier<String?>(null);
   final ValueNotifier<bool> _submittingNotifier = ValueNotifier<bool>(false);
+  final TextEditingController _captchaCodeController = TextEditingController();
   late final StreamSubscription<String?> _imageSub;
   String _captchaCode = '';
 
@@ -643,11 +970,13 @@ class _CaptchaDialogState extends State<_CaptchaDialog> {
       if (!mounted || url == null) return;
       _captchaImageNotifier.value = url;
     });
+    widget.onReady();
   }
 
   @override
   void dispose() {
     _imageSub.cancel();
+    _captchaCodeController.dispose();
     _captchaImageNotifier.dispose();
     _submittingNotifier.dispose();
     super.dispose();
@@ -715,6 +1044,7 @@ class _CaptchaDialogState extends State<_CaptchaDialog> {
                           ),
                           const SizedBox(height: 16),
                           TextField(
+                            controller: _captchaCodeController,
                             autofocus: true,
                             enabled: !isSubmitting,
                             onChanged: (value) => _captchaCode = value,

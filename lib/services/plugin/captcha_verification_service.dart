@@ -57,7 +57,12 @@ class CaptchaVerificationService {
     if (_disposed) return;
 
     _logSub?.cancel();
-    _logSub = _controller!.onLog.listen((msg) => KazumiLogger().d(msg));
+    _logSub = _controller!.onLog.listen(
+      (msg) => KazumiLogger().i(
+        '[CaptchaVerificationService] $msg',
+        forceLog: true,
+      ),
+    );
 
     _isInitialized = true;
     KazumiLogger().i('[CaptchaVerificationService] WebView initialized');
@@ -76,8 +81,9 @@ class CaptchaVerificationService {
 
     _imageFoundSub?.cancel();
     _imageFoundSub = _controller!.onCaptchaImageFound.listen((src) {
-      KazumiLogger()
-          .i('[CaptchaVerificationService] Captcha image found: $src');
+      KazumiLogger().i(
+        '[CaptchaVerificationService] Captcha image found: ${src.length} chars',
+      );
       if (!_captchaImageStreamController.isClosed) {
         _captchaImageStreamController.add(src);
       }
